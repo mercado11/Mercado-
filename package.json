@@ -1,7 +1,7 @@
 {
   "name": "mercado-backend",
   "version": "1.0.0",
-  "description": "Backend MERCADO : email de vérification, notifications, commandes WhatsApp, paiement CoinGate et virement bancaire.",
+  "description": "Backend MERCADO : email de vérification, notifications, commandes WhatsApp/Telegram, paiement par carte via Flutterwave.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
