@@ -329,10 +329,14 @@ app.post('/api/order', async (req, res) => {
    Utilise le "Standard Checkout" : Flutterwave héberge la page
    de paiement (carte + mobile money + virement local selon le
    pays du client), gère tout automatiquement sans code
-   supplémentaire côté site. L'argent est réglé sur le compte
-   Flutterwave du titulaire, en XAF pour un compte camerounais,
-   puis viré vers son compte bancaire (Afriland First Bank),
-   jamais vers un wallet crypto.
+   supplémentaire côté site. Le montant est calculé par le
+   serveur à partir du panier — le client ne peut pas le modifier.
+   L'argent est réglé sur le compte Flutterwave du titulaire, en
+   XAF pour un compte camerounais, puis viré vers son compte
+   bancaire (Afriland First Bank), jamais vers un wallet crypto.
+   Utilisez une clé FLWSECK_TEST-... pour tester sans vrai argent
+   (voir developer.flutterwave.com/docs/testing pour les cartes
+   de test), puis remplacez par FLWSECK-... (Live) pour le réel.
 ===================================================== */
 
 app.post('/api/payment/flutterwave', async (req, res) => {
@@ -748,11 +752,29 @@ app.get('/api/catalog/item', async (req, res) => {
   }
 });
 
+// eBay Browse API n'a pas de liste "meilleures ventes" : chercher le mot
+// "bestsellers" ne renvoie presque aucun résultat. On combine plusieurs
+// recherches de catégories populaires pour remplir la page d'accueil.
+const HOME_QUERIES = ['phone case', 'watch', 'sneakers', 'headphones', 'backpack', 'sunglasses', 'jewelry', 'kitchen gadget'];
+
 app.get('/api/catalog/home', async (req, res) => {
   const limit = Number(req.query.limit) || 48;
   try {
     if (process.env.EBAY_CLIENT_ID) {
-      const items = await ebaySearch('bestsellers', req.query.country, limit);
+      const perQuery = Math.max(4, Math.ceil(limit / HOME_QUERIES.length));
+      const batches = await Promise.all(
+        HOME_QUERIES.map(q => ebaySearch(q, req.query.country, perQuery).catch(() => []))
+      );
+      let items = batches.flat();
+      // mélange pour ne pas afficher les catégories groupées par bloc
+      for (let i = items.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [items[i], items[j]] = [items[j], items[i]];
+      }
+      items = items.slice(0, limit);
+      if (!items.length) {
+        return res.json({ items: (await localCatalog('')).slice(0, limit) });
+      }
       return res.json({ items });
     }
     res.json({ items: (await localCatalog('')).slice(0, limit) });
