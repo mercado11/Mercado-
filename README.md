@@ -145,3 +145,4 @@ mémoire/fichier local pour rester simple. Sur le plan gratuit de
 Render, le disque n'est pas garanti persistant après un redéploiement.
 Pour un usage réel à volume important, remplacez `data/*.json` par une
 vraie base de données (ex. Postgres gratuit sur Render).
+
