@@ -51,6 +51,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 const SUBSCRIBERS_FILE = path.join(DATA_DIR, 'subscribers.json');
 const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
 const REVIEWS_FILE = path.join(DATA_DIR, 'reviews.json');
+const CODES_FILE = path.join(DATA_DIR, 'verification-codes.json');
 
 function readJSON(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -114,7 +115,13 @@ async function sendEmail(to, subject, html) {
    CODE DE VÉRIFICATION EMAIL — 4 chiffres (en mémoire, expire 10 min)
 ===================================================== */
 
-const verificationCodes = new Map(); // email -> { code, expires }
+/* =====================================================
+   CODE DE VÉRIFICATION EMAIL — 4 chiffres, expire 10 min.
+   Stocké dans un fichier (pas juste en mémoire) pour survivre
+   à un redémarrage du serveur Render entre l'envoi du code et
+   sa saisie par le client — sinon un code pourtant correct
+   pouvait être refusé après une simple mise en veille du service.
+===================================================== */
 
 app.post('/api/email/send', async (req, res) => {
   try {
@@ -122,7 +129,9 @@ app.post('/api/email/send', async (req, res) => {
     if (!email || !email.includes('@')) return res.status(400).json({ error: 'email invalide' });
 
     const code = String(Math.floor(1000 + Math.random() * 9000));
-    verificationCodes.set(email, { code, expires: Date.now() + 10 * 60 * 1000 });
+    const codes = readJSON(CODES_FILE, {});
+    codes[email] = { code, expires: Date.now() + 10 * 60 * 1000 };
+    writeJSON(CODES_FILE, codes);
 
     await sendEmail(
       email,
@@ -143,12 +152,16 @@ app.post('/api/email/verify', (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const code = String(req.body.code || '').trim();
 
-  const entry = verificationCodes.get(email);
+  const codes = readJSON(CODES_FILE, {});
+  const entry = codes[email];
   if (!entry || entry.expires < Date.now()) {
     return res.json({ verified: false, reason: 'expired_or_missing' });
   }
   const ok = entry.code === code;
-  if (ok) verificationCodes.delete(email);
+  if (ok) {
+    delete codes[email];
+    writeJSON(CODES_FILE, codes);
+  }
   res.json({ verified: ok });
 });
 
@@ -345,10 +358,15 @@ app.post('/api/payment/flutterwave', async (req, res) => {
       return res.status(500).json({ error: 'Flutterwave non configuré' });
     }
     const order = req.body;
-    const amount = Number(order.total || 0);
+    let amount = Number(order.total || 0);
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: 'Montant invalide' });
     }
+    const currency = process.env.FLUTTERWAVE_CURRENCY || 'XAF';
+    // XAF (et quelques autres devises) n'ont pas de centimes : un montant
+    // avec virgule peut être refusé par Flutterwave. On arrondit.
+    const ZERO_DECIMAL_CURRENCIES = ['XAF', 'XOF', 'XPF', 'CVE', 'DJF', 'GNF', 'RWF', 'UGX', 'VUV', 'KMF'];
+    if (ZERO_DECIMAL_CURRENCIES.includes(currency)) amount = Math.round(amount);
 
     const r = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
@@ -359,12 +377,12 @@ app.post('/api/payment/flutterwave', async (req, res) => {
       body: JSON.stringify({
         tx_ref: order.orderId || `mercado-${Date.now()}`,
         amount: amount,
-        currency: process.env.FLUTTERWAVE_CURRENCY || 'XAF',
+        currency: currency,
         redirect_url: process.env.FRONTEND_SUCCESS_URL || process.env.PUBLIC_BASE_URL || '',
         customer: {
-          email: order.email || '',
-          name: order.name || '',
-          phonenumber: order.phone || ''
+          email: order.customer?.email || order.email || '',
+          name: order.customer?.name || order.name || '',
+          phonenumber: order.customer?.phone || order.phone || ''
         },
         customizations: {
           title: 'MERCADO',
@@ -636,13 +654,14 @@ async function getEbayToken() {
   return ebayToken.value;
 }
 
-async function ebaySearch(query, country, limit) {
+async function ebaySearch(query, country, limit, sort) {
   const mk = marketplaceFor(country);
   const token = await getEbayToken();
 
   const url = new URL('https://api.ebay.com/buy/browse/v1/item_summary/search');
   url.searchParams.set('q', query || 'bestsellers');
   url.searchParams.set('limit', String(limit || 48));
+  if (sort) url.searchParams.set('sort', sort);
 
   const r = await fetch(url, {
     headers: {
@@ -752,18 +771,76 @@ app.get('/api/catalog/item', async (req, res) => {
   }
 });
 
-// eBay Browse API n'a pas de liste "meilleures ventes" : chercher le mot
-// "bestsellers" ne renvoie presque aucun résultat. On combine plusieurs
-// recherches de catégories populaires pour remplir la page d'accueil.
-const HOME_QUERIES = ['phone case', 'watch', 'sneakers', 'headphones', 'backpack', 'sunglasses', 'jewelry', 'kitchen gadget'];
+// eBay renvoie SES PROPRES noms de catégories (ex. "Cell Phones &
+// Accessories"), qui ne correspondent jamais aux catégories du site
+// ("Phones", "Electronics"...). On force donc la bonne catégorie
+// nous-mêmes, à partir du terme de recherche utilisé pour la trouver.
+const CATEGORY_QUERIES = {
+  Electronics: 'electronics gadget',
+  Fashion: 'fashion clothing',
+  Home: 'home decor',
+  Phones: 'smartphone phone case',
+  Computers: 'laptop computer accessories',
+  Fitness: 'fitness equipment',
+  Sports: 'sports equipment',
+  Watches: 'watch',
+  Beauty: 'beauty cosmetics',
+  Automotive: 'car accessories',
+  Toys: 'toys'
+};
+const HOME_CATEGORIES = Object.keys(CATEGORY_QUERIES);
 
 app.get('/api/catalog/home', async (req, res) => {
-  const limit = Number(req.query.limit) || 48;
+  const limit = Number(req.query.limit) || 200;
+  const cat = req.query.cat && req.query.cat !== 'All' ? req.query.cat : null;
   try {
     if (process.env.EBAY_CLIENT_ID) {
-      const perQuery = Math.max(4, Math.ceil(limit / HOME_QUERIES.length));
+
+      // Une catégorie précise est demandée : on combine les meilleurs
+      // résultats (pertinence eBay = équivalent le plus proche de
+      // "tendance") avec les moins chers. UNIQUEMENT de vrais produits
+      // eBay — pas de complément avec le catalogue local fait à la main.
+      if (cat && CATEGORY_QUERIES[cat]) {
+        const [bestBatch, cheapBatch] = await Promise.all([
+          ebaySearch(CATEGORY_QUERIES[cat], req.query.country, 20).catch(() => []),
+          ebaySearch(CATEGORY_QUERIES[cat], req.query.country, 20, 'price').catch(() => [])
+        ]);
+        let items = [];
+        const seen = new Set();
+        const maxLen = Math.max(bestBatch.length, cheapBatch.length);
+        for (let i = 0; i < maxLen; i++) {
+          if (bestBatch[i] && !seen.has(bestBatch[i].id)) { items.push(bestBatch[i]); seen.add(bestBatch[i].id); }
+          if (cheapBatch[i] && !seen.has(cheapBatch[i].id)) { items.push(cheapBatch[i]); seen.add(cheapBatch[i].id); }
+        }
+        items = items.slice(0, Math.min(limit, 200)).map(it => ({ ...it, category: cat }));
+        // Si eBay est totalement injoignable (clé invalide, panne), on
+        // affiche le catalogue local en dernier recours plutôt qu'une
+        // page vide — mais jamais mélangé à de vrais résultats eBay.
+        if (!items.length) {
+          return res.json({ items: (await localCatalog('')).filter(p => p.category === cat) });
+        }
+        return res.json({ items });
+      }
+
+      // "Tout" : on ramène un lot de CHAQUE catégorie (mix meilleurs +
+      // moins chers), pour que chaque filtre du site ait vraiment des
+      // produits derrière lui.
+      const perCat = Math.max(10, Math.ceil(limit / HOME_CATEGORIES.length / 2));
       const batches = await Promise.all(
-        HOME_QUERIES.map(q => ebaySearch(q, req.query.country, perQuery).catch(() => []))
+        HOME_CATEGORIES.map(async c => {
+          const [bestBatch, cheapBatch] = await Promise.all([
+            ebaySearch(CATEGORY_QUERIES[c], req.query.country, perCat).catch(() => []),
+            ebaySearch(CATEGORY_QUERIES[c], req.query.country, perCat, 'price').catch(() => [])
+          ]);
+          let items = [];
+          const seen = new Set();
+          const maxLen = Math.max(bestBatch.length, cheapBatch.length);
+          for (let i = 0; i < maxLen; i++) {
+            if (bestBatch[i] && !seen.has(bestBatch[i].id)) { items.push(bestBatch[i]); seen.add(bestBatch[i].id); }
+            if (cheapBatch[i] && !seen.has(cheapBatch[i].id)) { items.push(cheapBatch[i]); seen.add(cheapBatch[i].id); }
+          }
+          return items.map(it => ({ ...it, category: c }));
+        })
       );
       let items = batches.flat();
       // mélange pour ne pas afficher les catégories groupées par bloc
@@ -771,11 +848,10 @@ app.get('/api/catalog/home', async (req, res) => {
         const j = Math.floor(Math.random() * (i + 1));
         [items[i], items[j]] = [items[j], items[i]];
       }
-      items = items.slice(0, limit);
       if (!items.length) {
         return res.json({ items: (await localCatalog('')).slice(0, limit) });
       }
-      return res.json({ items });
+      return res.json({ items: items.slice(0, limit) });
     }
     res.json({ items: (await localCatalog('')).slice(0, limit) });
   } catch (e) {
